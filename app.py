@@ -1,17 +1,43 @@
 import streamlit as st
 import tempfile
 import subprocess
+import base64
+import json
+import re
 from pathlib import Path
+from openai import OpenAI
 
-st.set_page_config(page_title="Manhwa Automation", page_icon="🎬")
 
-st.title("🎬 Manhwa Automation")
-st.write("English narration + manhwa panels ko narration timing ke according rough-cut video me convert karo.")
+# =========================================================
+# PAGE
+# =========================================================
 
-api_key = st.text_input("OpenAI API Key", type="password")
+st.set_page_config(
+    page_title="Manhwa AI Automation",
+    page_icon="🎬",
+    layout="centered"
+)
+
+st.title("🎬 Manhwa AI Automation")
+
+st.write(
+    "English narration + manhwa panels upload karo. "
+    "AI panels ko analyze karke narration ke according "
+    "automatic rough-cut video banayega."
+)
+
+
+# =========================================================
+# INPUTS
+# =========================================================
+
+api_key = st.text_input(
+    "OpenAI API Key",
+    type="password"
+)
 
 audio = st.file_uploader(
-    "🎙️ English narration audio",
+    "🎙️ English narration",
     type=["mp3", "wav", "m4a", "aac", "mp4"]
 )
 
@@ -21,128 +47,206 @@ panels = st.file_uploader(
     accept_multiple_files=True
 )
 
-if st.button("🚀 Video Banao", use_container_width=True):
 
-    if not audio or not panels:
-        st.error("Audio aur panels dono upload karo.")
-        st.stop()
+# =========================================================
+# SETTINGS
+# =========================================================
 
-    if not api_key:
-        st.error("OpenAI API key daalo.")
-        st.stop()
+vision_model = st.selectbox(
+    "🧠 Panel AI model",
+    [
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol"
+    ],
+    index=0
+)
 
+st.caption(
+    "Luna = lower-cost option. "
+    "Sol = stronger reasoning but potentially higher cost."
+)
+
+
+# =========================================================
+# HELPER: IMAGE -> DATA URL
+# =========================================================
+
+def image_to_data_url(path):
+
+    suffix = path.suffix.lower()
+
+    mime = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp"
+    }.get(suffix, "image/jpeg")
+
+    data = base64.b64encode(
+        path.read_bytes()
+    ).decode("utf-8")
+
+    return f"data:{mime};base64,{data}"
+
+
+# =========================================================
+# HELPER: EXTRACT JSON
+# =========================================================
+
+def extract_json(text):
+
+    text = text.strip()
+
+    # Remove markdown code fences
+    text = re.sub(
+        r"```json\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"```\s*",
+        "",
+        text
+    )
+
+    # Try direct JSON
     try:
-        from openai import OpenAI
+        return json.loads(text)
+    except:
+        pass
 
-        client = OpenAI(api_key=api_key)
+    # Try finding JSON object
+    match = re.search(
+        r"\{.*\}",
+        text,
+        flags=re.DOTALL
+    )
 
-        work = Path(tempfile.mkdtemp())
+    if match:
 
-        # Save audio
-        audio_path = work / audio.name
-        audio_path.write_bytes(audio.getvalue())
-
-        # Save panels
-        panel_dir = work / "panels"
-        panel_dir.mkdir()
-
-        for i, panel in enumerate(panels):
-            ext = Path(panel.name).suffix.lower() or ".jpg"
-            path = panel_dir / f"{i:04d}{ext}"
-            path.write_bytes(panel.getvalue())
-
-        # -------------------------
-        # 1. TRANSCRIBE AUDIO
-        # -------------------------
-
-        st.write("🎙️ Audio transcribe ho raha hai...")
-
-        with open(audio_path, "rb") as f:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="verbose_json"
+        try:
+            return json.loads(
+                match.group(0)
             )
+        except:
+            pass
 
-        segments = getattr(transcript, "segments", None) or []
+    return None
 
-        if not segments:
-            st.error("Audio ke timestamp segments nahi mile.")
-            st.stop()
 
-        # -------------------------
-        # 2. GET AUDIO TIMELINE
-        # -------------------------
+# =========================================================
+# AI: ANALYZE PANELS
+# =========================================================
 
-        timeline = []
+def analyze_panel_batch(client, panel_paths, model):
 
-        for segment in segments:
-            start = float(segment.start)
-            end = float(segment.end)
-            text = segment.text.strip()
+    content = [
+        {
+            "type": "input_text",
+            "text": """
+You are analyzing manga/manhwa panels for an automated
+video editor.
 
-            if text:
-                timeline.append({
-                    "start": start,
-                    "end": end,
-                    "text": text
-                })
+For EVERY image, identify:
 
-        if not timeline:
-            st.error("Narration timeline create nahi ho payi.")
-            st.stop()
+1. panel_id
+2. characters visible
+3. important actions
+4. emotions/reactions
+5. location/background
+6. important objects
+7. what is happening in the scene
+8. a short visual description
 
-        st.success(f"✅ {len(timeline)} narration segments mile.")
+IMPORTANT:
 
-        # -------------------------
-        # 3. NORMALIZE PANELS
-        # -------------------------
+- Do NOT invent events that are not visible.
+- Focus only on what can actually be seen.
+- Keep descriptions concise.
+- Preserve the image order.
+"""
+        }
+    ]
 
-        st.write("🖼️ Panels prepare ho rahe hain...")
+    for path in panel_paths:
 
-        image_files = sorted([
-            p for p in panel_dir.iterdir()
-            if p.is_file()
-        ])
+        data_url = image_to_data_url(path)
 
-        norm = work / "normalized"
-        norm.mkdir()
+        content.append({
+            "type": "input_text",
+            "text": f"IMAGE FILE: {path.name}"
+        })
 
-        valid = []
+        content.append({
+            "type": "input_image",
+            "image_url": data_url
+        })
 
-        for i, image in enumerate(image_files):
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "user",
+                "content": content
+            }
+        ]
+    )
 
-            output = norm / f"panel_{i:04d}.jpg"
+    return response.output_text
 
-            subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(image),
-                    "-vf",
-                    "scale=1920:1080:force_original_aspect_ratio=decrease,"
-                    "pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                    "-q:v",
-                    "2",
-                    str(output)
-                ],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
 
-            valid.append(output)
+# =========================================================
+# AI: MATCH PANELS TO NARRATION
+# =========================================================
 
-        if not valid:
-            st.error("Koi valid panel nahi mila.")
-            st.stop()
+def match_panels_to_narration(
+    client,
+    model,
+    narration_segments,
+    panel_descriptions
+):
 
-        # -------------------------
-        # 4. MATCH PANELS TO NARRATION
-        # -------------------------
+    narration_text = []
 
-        st.write("🧠 Narration ke according panels match ho rahe hain...")
+    for i, seg in enumerate(narration_segments):
 
-        # Abhi basic sequential matching.
-        # IMPORTANT
+        narration_text.append(
+            f"""
+SEGMENT {i + 1}
+START: {seg['start']:.3f}
+END: {seg['end']:.3f}
+DURATION: {seg['duration']:.3f}
+TEXT: {seg['text']}
+"""
+        )
+
+    prompt = f"""
+You are an expert manga/manhwa video editor.
+
+We have:
+
+A) narration segments with exact timestamps
+
+B) AI descriptions of manhwa panels.
+
+Your job is to decide which panel(s) should appear
+during each narration segment.
+
+IMPORTANT RULES:
+
+1. Use the visual content of the panels.
+2. Match panels semantically to what the narrator is saying.
+3. Do NOT simply assign panels in numerical order.
+4. A panel can stay on screen longer than 5 seconds.
+5. A panel can stay on screen less than 5 seconds.
+6. If one narration segment is best represented by one panel,
+   use one panel for the whole segment.
+7. If two or more panels are useful for one narration segment,
+   divide the segment duration between them.
+8. Do not use a panel for an event that it clearly does not show.
+9. Prefer the most visually relevant panel.
+10. Avoid unnecessary rapid cuts.
+11. The final timeline must
